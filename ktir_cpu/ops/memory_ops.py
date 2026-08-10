@@ -721,6 +721,87 @@ class MemoryOps:
         return offs, unique
 
     @staticmethod
+    def _resolve_sparse_offsets(
+        tile_ref: TileRef,
+        coords: Optional[List[Tuple[int, ...]]],
+        offsets: Optional[np.ndarray],
+        stick_bytes: Optional[int],
+    ) -> Tuple[np.ndarray, Optional[int]]:
+        """Normalize a sparse load/store request to a flat offsets array.
+
+        *offsets*, if given, is already a flat element-offset array
+        (blocked-indirect fast path) — just count the sticks it touches.
+        Otherwise *coords* is linearized via ``_flat_memory_offsets``.
+        """
+        if offsets is not None:
+            bpe = _bytes_per_elem(tile_ref.dtype)
+            unique_sticks = _MemAccessor.count_sticks_array(
+                tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
+            )
+            return offsets, unique_sticks
+        return MemoryOps._flat_memory_offsets(
+            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
+            coords, stick_bytes=stick_bytes,
+        )
+
+    @staticmethod
+    def _load_contiguous(
+        context: CoreContext, mgr: "_MemAccessor", tile_ref: TileRef, stick_bytes: Optional[int],
+    ) -> Tile:
+        """Load the full tile via a single dict-key read — no coord/offset filtering."""
+        n = int(np.prod(tile_ref.shape))
+        data = mgr.read(n, tile_ref.dtype).reshape(tile_ref.shape)
+        MemoryOps._write_to_lx(context, data)
+        if stick_bytes:
+            bpe = _bytes_per_elem(tile_ref.dtype)
+            end = tile_ref.base_ptr + n * bpe
+            unique_sticks = (
+                (end + stick_bytes - 1) // stick_bytes
+                - tile_ref.base_ptr // stick_bytes
+            )
+        else:
+            unique_sticks = None
+        return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
+
+    @staticmethod
+    def _load_sparse(
+        context: CoreContext, mgr: "_MemAccessor", tile_ref: TileRef,
+        coords: Optional[List[Tuple[int, ...]]], offsets: Optional[np.ndarray],
+        stick_bytes: Optional[int], result_shape: Optional[Tuple[int, ...]],
+    ) -> Tile:
+        """Gather elements at *coords* or pre-computed *offsets* into a Tile."""
+        offsets, unique_sticks = MemoryOps._resolve_sparse_offsets(tile_ref, coords, offsets, stick_bytes)
+        gathered = mgr.read(len(offsets), tile_ref.dtype, offsets=offsets)
+        out_shape = result_shape if result_shape is not None else tile_ref.shape
+        data = gathered.reshape(out_shape)
+        MemoryOps._write_to_lx(context, data)
+        return Tile(data, tile_ref.dtype, out_shape, unique_sticks)
+
+    @staticmethod
+    def _store_contiguous(mgr: "_MemAccessor", tile_ref: TileRef, tile: Tile, stick_bytes: Optional[int]) -> int:
+        """Store the full tile via a single dict-key write — no coord/offset filtering."""
+        mgr.write(tile.data.ravel())
+        if not stick_bytes:
+            return 0
+        n = int(np.prod(tile_ref.shape))
+        bpe = _bytes_per_elem(tile_ref.dtype)
+        end = tile_ref.base_ptr + n * bpe
+        return (
+            (end + stick_bytes - 1) // stick_bytes
+            - tile_ref.base_ptr // stick_bytes
+        )
+
+    @staticmethod
+    def _store_sparse(
+        mgr: "_MemAccessor", tile_ref: TileRef, tile: Tile,
+        coords: Optional[List[Tuple[int, ...]]], offsets: Optional[np.ndarray], stick_bytes: Optional[int],
+    ) -> int:
+        """Scatter tile elements to *coords* or pre-computed *offsets*."""
+        offsets, unique_sticks = MemoryOps._resolve_sparse_offsets(tile_ref, coords, offsets, stick_bytes)
+        mgr.write(tile.data.ravel(), offsets=offsets)
+        return unique_sticks if unique_sticks is not None else 0
+
+    @staticmethod
     def load(
         context: CoreContext,
         tile_ref: TileRef,
@@ -734,11 +815,10 @@ class MemoryOps:
         - HBM source → DMA read from HBM, write into LX scratchpad.
         - LX source  → logical copy within LX (no physical movement).
 
-        Three dispatch modes (checked in order):
-        1. *offsets* — pre-computed flat element offsets (blocked-indirect fast
-           path). Skips coordinate linearization entirely.
-        2. *coords* — gathers elements at those local coordinates.
-        3. Neither — loads the full tile (contiguous or strided).
+        Two dispatch modes, each in its own helper:
+        - Neither *offsets* nor *coords* → ``_load_contiguous`` (single dict-key read).
+        - *offsets* or *coords* → ``_load_sparse`` (gather; *offsets* skips
+          coordinate linearization, *coords* is linearized first).
 
         A single ``mem.read`` covers the entire element footprint; no
         per-element dict scans occur.
@@ -759,45 +839,9 @@ class MemoryOps:
         mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
         stick_bytes = mgr.stick_bytes
 
-        # Pre-computed offsets path (blocked-indirect fast path).
-        if offsets is not None:
-            bpe = _bytes_per_elem(tile_ref.dtype)
-            unique_sticks = _MemAccessor.count_sticks_array(
-                tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
-            )
-            gathered = mgr.read(len(offsets), tile_ref.dtype, offsets=offsets)
-            out_shape = result_shape if result_shape is not None else tile_ref.shape
-            data = gathered.reshape(out_shape)
-            MemoryOps._write_to_lx(context, data)
-            return Tile(data, tile_ref.dtype, out_shape, unique_sticks)
-
-        # Fast path: contiguous tile, no coord filtering — single dict-key read.
-        if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            n = int(np.prod(tile_ref.shape))
-            data = mgr.read(n, tile_ref.dtype).reshape(tile_ref.shape)
-            MemoryOps._write_to_lx(context, data)
-            if stick_bytes:
-                bpe = _bytes_per_elem(tile_ref.dtype)
-                end = tile_ref.base_ptr + n * bpe
-                unique_sticks = (
-                    (end + stick_bytes - 1) // stick_bytes
-                    - tile_ref.base_ptr // stick_bytes
-                )
-            else:
-                unique_sticks = None
-            return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
-
-        # Strided or coord-set path: linearize coords → sparse read via offsets.
-        offsets, unique_sticks = MemoryOps._flat_memory_offsets(
-            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
-            coords, stick_bytes=stick_bytes
-        )
-        gathered = mgr.read(len(offsets), tile_ref.dtype, offsets=offsets)
-        out_shape = result_shape if result_shape is not None else tile_ref.shape
-        data = gathered.reshape(out_shape)
-
-        MemoryOps._write_to_lx(context, data)
-        return Tile(data, tile_ref.dtype, out_shape, unique_sticks)
+        if offsets is None and coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
+            return MemoryOps._load_contiguous(context, mgr, tile_ref, stick_bytes)
+        return MemoryOps._load_sparse(context, mgr, tile_ref, coords, offsets, stick_bytes, result_shape)
 
     @staticmethod
     def store(
@@ -812,12 +856,10 @@ class MemoryOps:
         - HBM target → DMA write from LX to HBM.
         - LX target  → write directly to LX.
 
-        Three dispatch modes (checked in order):
-        1. *offsets* — pre-computed flat element offsets (blocked-indirect fast
-           path). Skips coordinate linearization entirely.
-        2. *coords* — scatters tile elements to those coordinates via
-           read-modify-write on the allocation.
-        3. Neither — stores the full tile (contiguous or strided).
+        Two dispatch modes, each in its own helper:
+        - Neither *offsets* nor *coords* → ``_store_contiguous`` (single dict-key write).
+        - *offsets* or *coords* → ``_store_sparse`` (scatter; *offsets* skips
+          coordinate linearization, *coords* is linearized first).
 
         Args:
             context: Core execution context
@@ -834,35 +876,9 @@ class MemoryOps:
         mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
         stick_bytes = mgr.stick_bytes
 
-        # Pre-computed offsets path (blocked-indirect fast path).
-        if offsets is not None:
-            bpe = _bytes_per_elem(tile_ref.dtype)
-            unique_sticks = _MemAccessor.count_sticks_array(
-                tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
-            )
-            mgr.write(tile.data.ravel(), offsets=offsets)
-            return unique_sticks if unique_sticks is not None else 0
-
-        # Fast path: contiguous tile, no coord filtering — single dict-key write.
-        if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            mgr.write(tile.data.ravel())
-            if not stick_bytes:
-                return 0
-            n = int(np.prod(tile_ref.shape))
-            bpe = _bytes_per_elem(tile_ref.dtype)
-            end = tile_ref.base_ptr + n * bpe
-            return (
-                (end + stick_bytes - 1) // stick_bytes
-                - tile_ref.base_ptr // stick_bytes
-            )
-
-        # Strided or coord-set path: sparse write via offsets.
-        offsets, unique_sticks = MemoryOps._flat_memory_offsets(
-            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
-            coords, stick_bytes=stick_bytes,
-        )
-        mgr.write(tile.data.ravel(), offsets=offsets)
-        return unique_sticks if unique_sticks is not None else 0
+        if offsets is None and coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
+            return MemoryOps._store_contiguous(mgr, tile_ref, tile, stick_bytes)
+        return MemoryOps._store_sparse(mgr, tile_ref, tile, coords, offsets, stick_bytes)
 
     @staticmethod
     def indirect_load(
