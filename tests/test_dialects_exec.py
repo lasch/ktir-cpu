@@ -1699,6 +1699,106 @@ class TestLinalg:
         assert result.shape == (D0, stick * lane)
         assert np.allclose(result.data, expected, rtol=1e-5)
 
+    def test_generic_reduction_composite_output_map_collision(self):
+        # Unlike the two tests above, the composite output map here is
+        # genuinely many-to-one: (d2, d3) both range over [0, 2), and
+        # `d2 + d3` puts two distinct pairs -- (0, 1) and (1, 0) -- onto the
+        # same output element. This is the case that distinguishes an
+        # accumulate from a silent overwrite on collision.
+        D0, D1, W2, W3 = 2, 3, 2, 2
+        in_data = (np.arange(D0 * D1 * W2 * W3, dtype=np.float32)
+                   .reshape(D0, D1, W2, W3))
+        out_data = np.full((D0, 3), 5.0, dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", in_data.shape)
+        out_tile = Tile(out_data, "f32", out_data.shape)
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%oo"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d2 + d3)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "parallel", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+
+        summed = in_data.sum(axis=1)  # sum over D1 (reduction) -> (D0, W2, W3)
+        expected = out_data.copy()
+        for d0 in range(D0):
+            for d2 in range(W2):
+                for d3 in range(W3):
+                    expected[d0, d2 + d3] += summed[d0, d2, d3]
+        assert result.shape == (D0, 3)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
+    def test_generic_reduction_composite_output_map_extent_inference_gap(self):
+        # Residual gap tracked in docs/gap_analysis.md row 26: a dim
+        # referenced only inside a composite output expr (never as a bare
+        # dim-ref in any indexing map) can't have its extent inferred.
+        # Pinned here so a change to this behaviour (different exception,
+        # or the gap silently closing) doesn't drift out of sync with the
+        # gap-analysis doc.
+        D0, D1, stick = 4, 3, 2
+        in_data = np.zeros((D0, D1, stick), dtype=np.float32)
+        out_data = np.zeros((D0, 8), dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", in_data.shape)
+        out_tile = Tile(out_data, "f32", out_data.shape)
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%oo"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    # d3 never appears as a bare dim-ref anywhere.
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d2 * 4 + d3)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "parallel", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        with pytest.raises(ValueError, match=r"cannot infer extent for dims \[3\]"):
+            dispatch("linalg.generic")(op, ctx, env)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()

@@ -432,7 +432,7 @@ def _scatter_output(
     shape is the iteration shape restricted to the non-reduction dims, in
     increasing dim-index order.
 
-    Fast path (bare dim-projection): identical to the pre-#216 behaviour — one
+    Fast path (bare dim-projection): identical to the previous behaviour — one
     vectorised ``_run_combiner`` call relying on ``reduced_tile`` already
     lining up 1:1 with ``outs_val``. This must stay a no-op change for every
     map shape the existing tests exercise.
