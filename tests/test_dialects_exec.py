@@ -1799,6 +1799,68 @@ class TestLinalg:
         with pytest.raises(ValueError, match=r"cannot infer extent for dims \[3\]"):
             dispatch("linalg.generic")(op, ctx, env)
 
+    @pytest.mark.parametrize(
+        "combiner,reduce_fn",
+        [("arith.maximumf", np.max), ("arith.minimumf", np.min)],
+        ids=["max", "min"],
+    )
+    def test_generic_reduction_composite_output_map_minmax_combiner(self, combiner, reduce_fn):
+        # The composite-output-map tests above only exercise arith.addf.
+        # _scatter_output's general path is combiner-agnostic by
+        # construction, but this function has a history of max/min
+        # combiners behaving differently from the add path, so exercise a
+        # max/min variant through the same stick/lane composite output map.
+        # outs is pre-filled with the true identity, matching the
+        # convention used by test_generic_reduction_minmax_combiners.
+        D0, D1, stick, lane = 4, 6, 2, 8
+        identity = -np.inf if "max" in combiner else np.inf
+        in_data = (np.arange(stick * D0 * D1 * lane, dtype=np.float32)
+                   .reshape(stick, D0, D1, lane))
+        out_data = np.full((D0, stick * lane), identity, dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", in_data.shape)
+        out_tile = Tile(out_data, "f32", out_data.shape)
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op(combiner, operands=["%ii", "%oo"], result="%r"),
+            _op("linalg.yield", operands=["%r"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d2, d0, d1, d3)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d2 * 8 + d3)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "parallel", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+
+        reduced = reduce_fn(in_data, axis=2)  # reduce over D1 -> (stick, D0, lane)
+        expected = reduced.transpose(1, 0, 2).reshape(D0, stick * lane)
+        assert result.shape == (D0, stick * lane)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()
