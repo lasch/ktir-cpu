@@ -1593,6 +1593,112 @@ class TestLinalg:
         else:
             assert np.array_equal(result.data, expected)
 
+    def test_generic_reduction_composite_output_map(self):
+        # Output indexing map merges two iteration dims (stick, lane) into
+        # one output axis via `d2 * 32 + d3`. Reduces [D0,D1,D2]=[16,96,64]
+        # over the middle axis D1, with the input stick-tiled on D2 (2 sticks
+        # x 32 lanes) and a plain [16,64] output.
+        D0, D1, stick, lane = 16, 96, 2, 32
+        in_data = (np.arange(stick * D0 * D1 * lane, dtype=np.float32)
+                   .reshape(stick, D0, D1, lane))
+        out_data = np.zeros((D0, stick * lane), dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", in_data.shape)
+        out_tile = Tile(out_data, "f32", out_data.shape)
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%oo"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d2, d0, d1, d3)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d2 * 32 + d3)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "parallel", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+
+        summed = in_data.sum(axis=2)  # sum over D1 -> (stick, D0, lane)
+        expected = summed.transpose(1, 0, 2).reshape(D0, stick * lane) + out_data
+        assert result.shape == (D0, stick * lane)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
+    def test_generic_reduction_composite_output_map_nonneutral_outs(self):
+        # Same shape as test_generic_reduction_composite_output_map, but with
+        # a non-neutral outs seed -- confirms the scatter's accumulator
+        # (seeded from outs_val) combines with the reduced value exactly
+        # once, not zero or twice.
+        D0, D1, stick, lane = 16, 96, 2, 32
+        in_data = (np.arange(stick * D0 * D1 * lane, dtype=np.float32)
+                   .reshape(stick, D0, D1, lane))
+        out_data = np.full((D0, stick * lane), 3.0, dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", in_data.shape)
+        out_tile = Tile(out_data, "f32", out_data.shape)
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%oo"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d2, d0, d1, d3)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d2 * 32 + d3)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "parallel", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+
+        summed = in_data.sum(axis=2)
+        expected = summed.transpose(1, 0, 2).reshape(D0, stick * lane) + out_data
+        assert result.shape == (D0, stick * lane)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()
