@@ -1861,6 +1861,55 @@ class TestLinalg:
         assert result.shape == (D0, stick * lane)
         assert np.allclose(result.data, expected, rtol=1e-5)
 
+    def test_generic_reduction_composite_output_map_out_of_range(self):
+        # A composite output map with a wrong stride (d2 * 40 instead of the
+        # correct d2 * 32) drives out_idx past the output's extent. This must
+        # raise a descriptive ValueError naming the map/dims, not a bare
+        # NumPy IndexError.
+        D0, D1, stick, lane = 16, 96, 2, 32
+        in_data = (np.arange(stick * D0 * D1 * lane, dtype=np.float32)
+                   .reshape(stick, D0, D1, lane))
+        out_data = np.zeros((D0, stick * lane), dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", in_data.shape)
+        out_tile = Tile(out_data, "f32", out_data.shape)
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%oo"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d2, d0, d1, d3)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3) -> (d0, d2 * 40 + d3)>"),
+                ],
+                "iterator_types": ["parallel", "reduction", "parallel", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        with pytest.raises(ValueError, match=r"out-of-range index"):
+            dispatch("linalg.generic")(op, ctx, env)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()
